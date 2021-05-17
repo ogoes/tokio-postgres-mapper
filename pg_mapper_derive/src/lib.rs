@@ -54,64 +54,88 @@ fn impl_tokio_pg_mapper(
     ty_generics: &TypeGenerics,
     where_clause: &Option<&WhereClause>,
 ) -> Item {
-    let fields = s.fields.iter().map(|field| {
-        let ident = field.ident.as_ref().unwrap();
-        let ty = &field.ty;
-
-        let row_expr = format!(r##"{}"##, ident);
-        quote! {
-            #ident:row.try_get::<&str,#ty>(#row_expr)?
-        }
-    });
-
-    let ref_fields = s.fields.iter().map(|field| {
-        let ident = field.ident.as_ref().unwrap();
-        let ty = &field.ty;
-
-        let row_expr = format!(r##"{}"##, ident);
-        quote! {
-            #ident:row.try_get::<&str,#ty>(&#row_expr)?
-        }
-    });
-
-    let table_columns = s
+    let required_fields = s
         .fields
+        .iter()
+        .filter(|field| match check_field_attributes(&field.attrs) {
+            FieldAttr::Ignored | FieldAttr::Collection => false,
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+
+
+    let fields = required_fields.iter().map(|field| {
+        let ident = field.ident.as_ref().unwrap();
+        let ty = &field.ty;
+
+        let row_expr = format!(r##"{}"##, ident);
+
+        match check_field_attributes(&field.attrs) {
+            FieldAttr::Flatten => (quote! {
+                #ident:<#ty>::from_row_ref_prefixed(&row, prefix)?
+            }),
+            _ => (quote! {
+                #ident:row.try_get::<&str,#ty>(format!("{}{}", prefix, #row_expr).as_str())?
+            }),
+        }
+    });
+
+    let table_columns = required_fields
         .iter()
         .map(|field| {
             let ident = field
                 .ident
                 .as_ref()
-                .expect("Expected structfield identifier");
+                .expect("Expected struct field identifier");
             format!(" {0}.{1} ", table_name, ident)
         })
         .collect::<Vec<String>>()
         .join(", ");
 
-    let columns = s
-        .fields
+    let columns = required_fields
         .iter()
         .map(|field| {
             let ident = field
                 .ident
                 .as_ref()
-                .expect("Expected structfield identifier");
+                .expect("Expected struct field identifier");
             format!(" {} ", ident)
         })
         .collect::<Vec<String>>()
         .join(", ");
 
+    let has_ignored_fields = s.fields.len() != required_fields.len();
+
+    let from_row = if has_ignored_fields {
+        quote! {
+            Self {
+                #(#fields),*,
+                ..Default::default()
+            }
+        }
+    } else {
+        quote! {
+            Self {
+                #(#fields),*
+            }
+        }
+    };
+
     let tokens = quote! {
+
         impl #impl_generics tokio_pg_mapper::FromTokioPostgresRow for #name #ty_generics #where_clause {
             fn from_row(row: tokio_postgres::row::Row) -> ::std::result::Result<Self, tokio_pg_mapper::Error> {
-                Ok(Self {
-                    #(#fields),*
-                })
+                let prefix = r##""##;
+                Ok(#from_row)
             }
 
             fn from_row_ref(row: &tokio_postgres::row::Row) -> ::std::result::Result<Self, tokio_pg_mapper::Error> {
-                Ok(Self {
-                    #(#ref_fields),*
-                })
+                let prefix = r##""##;
+                Ok(#from_row)
+            }
+
+            fn from_row_ref_prefixed(row: &tokio_postgres::row::Row, prefix: &str) -> ::std::result::Result<Self, tokio_pg_mapper::Error> {
+                Ok(#from_row)
             }
 
             fn sql_table() -> String {
@@ -160,6 +184,43 @@ fn get_lit_str<'a>(
         Err(())
     }
 }
+#[derive(Debug)]
+enum FieldAttr {
+    Ignored,
+    Flatten,
+    Undefined,
+    Collection,
+}
+
+fn check_field_attributes(attributes: &Vec<syn::Attribute>) -> FieldAttr {
+    let mut flag = FieldAttr::Undefined;
+    for meta_items in attributes.iter().filter_map(get_mapper_meta_items) {
+        for meta_item in meta_items {
+            match meta_item {
+                Meta(m) if m.path().is_ident("ignore") => {
+                    flag = FieldAttr::Ignored;
+                }
+                Meta(m) if m.path().is_ident("flatten") => {
+                    flag = match flag {
+                        FieldAttr::Undefined => FieldAttr::Flatten,
+                        _ => flag,
+                    }
+                }
+                Meta(m) if m.path().is_ident("collection") => {
+                    flag = match flag {
+                        FieldAttr::Ignored => FieldAttr::Ignored,
+                        _ => FieldAttr::Collection,
+                    }
+                }
+                _ => {
+                    return FieldAttr::Undefined;
+                }
+            }
+        }
+    }
+
+    flag
+}
 
 fn parse_table_attr(ast: &DeriveInput) -> String {
     // Parse `#[pg_mapper(table = "foo")]`
@@ -175,7 +236,7 @@ fn parse_table_attr(ast: &DeriveInput) -> String {
                     }
                 }
                 Meta(_) => {
-                    panic!(format!("unknown pg_mapper container attribute",))
+                    panic!("unknown pg_mapper container attribute")
                 }
                 _ => {
                     panic!("unexpected literal in pg_mapper container attribute");

@@ -62,7 +62,7 @@ pub use tokio_pg_mapper_derive::*;
 
 use tokio_postgres::row::Row as TokioRow;
 
-use std::error::Error as StdError;
+use std::{error::Error as StdError, hash::Hash};
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 /// Trait containing various methods for converting from a `tokio-postgres` Row
@@ -105,6 +105,11 @@ pub trait FromTokioPostgresRow: Sized {
     /// [`Error::Conversion`]: enum.Error.html#variant.Conversion
     fn from_row_ref(row: &TokioRow) -> Result<Self, Error>;
 
+    fn from_row_ref_prefixed(
+        row: &TokioRow,
+        prefix: &str,
+    ) -> ::std::result::Result<Self, Error>;
+
     /// Get the name of the annotated sql table name.
     ///
     /// Example:
@@ -121,9 +126,8 @@ pub trait FromTokioPostgresRow: Sized {
     ///     }
     /// ```
     fn sql_table() -> String;
-    
-    
-    /// Get a list of the field names, excluding table name prefix. 
+
+    /// Get a list of the field names, excluding table name prefix.
     ///
     /// Example:
     ///
@@ -163,6 +167,47 @@ pub trait FromTokioPostgresRow: Sized {
     fn sql_table_fields() -> String;
 }
 
+
+pub trait Joinable: Hash + Sized {
+    fn join(rows: Vec<TokioRow>) -> Result<Vec<Self>, Error>;
+
+    fn join_once(rows: Vec<TokioRow>) -> Result<Self, Error>;
+}
+
+
+
+impl<T: FromTokioPostgresRow> FromTokioPostgresRow for Option<T> {
+    fn from_row(row: TokioRow) -> Result<Self, Error> {
+        Self::from_row_ref_prefixed(&row, "")
+    }
+
+    fn from_row_ref(row: &TokioRow) -> Result<Self, Error> {
+        Self::from_row_ref_prefixed(row, "")
+    }
+
+    fn from_row_ref_prefixed(row: &TokioRow, prefix: &str) -> Result<Self, Error> {
+        let mapped = T::from_row_ref_prefixed(row, prefix);
+
+        Ok(match mapped {
+            Ok(value) => Some(value),
+            Err(Error::ColumnNotFound) => None,
+            _ => Some(mapped?),
+        })
+    }
+
+    fn sql_table() -> String {
+        T::sql_table()
+    }
+
+    fn sql_fields() -> String {
+        T::sql_fields()
+    }
+
+    fn sql_table_fields() -> String {
+        T::sql_table_fields()
+    }
+}
+
 /// General error type returned throughout the library.
 #[derive(Debug)]
 pub enum Error {
@@ -171,7 +216,7 @@ pub enum Error {
     /// An error from the `tokio-postgres` crate while converting a type.
     Conversion(Box<dyn StdError + Send + Sync>),
     /// Used in a scenario where tokios_postgres::Error::into_source returns None
-    UnknownTokioPG(String)
+    UnknownTokioPG(String),
 }
 
 impl From<tokio_postgres::Error> for Error {
@@ -194,7 +239,9 @@ impl From<Box<dyn StdError + Send + Sync>> for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         match self {
-            Error::ColumnNotFound => f.write_str("Tokio-postgres-mapper: Column not found"),
+            Error::ColumnNotFound => {
+                f.write_str("Tokio-postgres-mapper: Column not found")
+            }
             Error::UnknownTokioPG(reason) => f.write_str(reason),
             Error::Conversion(err) => f.write_str(err.to_string().as_str()),
         }
@@ -205,7 +252,7 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match *self {
             Error::Conversion(ref inner) => inner.source(),
-            _ => None
+            _ => None,
         }
     }
 }
